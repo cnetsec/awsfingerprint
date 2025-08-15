@@ -1,4 +1,4 @@
-name: AWS Fingerprint — multi domains (passive)
+name: AWS Fingerprint — Passive DAST (multi domains)
 
 on:
   workflow_dispatch:
@@ -6,18 +6,19 @@ on:
       domains:
         description: "Lista de domínios/subdomínios (separados por vírgula)"
         required: true
-        default: "Coloque o(s) dominios aqui separados por virgula"
+        default: "exemplo.com, api.exemplo.com"
+
 jobs:
   fingerprint:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: 🧰 Setup deps
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq dnsutils moreutils
+          sudo apt-get install -y jq dnsutils moreutils curl openssl
           jq --version
 
       - name: 🔎 Normaliza lista de domínios
@@ -31,53 +32,65 @@ jobs:
           COUNT=$(wc -l < domains.txt | tr -d ' ')
           echo "count=$COUNT" >> $GITHUB_OUTPUT
 
-      - name: 📦 Funções utilitárias
+      - name: 📦 Utilitários
         run: |
           cat > utils.sh <<'BASH'
           #!/usr/bin/env bash
           set -eo pipefail
 
+          # ============ HTTP helpers ============
           fetch_headers() {
-            local host="$1"
-            local scheme="${2:-https}"
+            local host="$1" scheme="${2:-https}"
             local url="${scheme}://${host}/"
-            curl -skI --max-time 12 "$url" | tr -d '\r' > /tmp/h.txt || true
-            cat /tmp/h.txt
+            curl -skI --max-time 12 "$url" | tr -d '\r' || true
+          }
+          head_path() { curl -skI --max-time 10 "$1" | tr -d '\r' || true; }
+          get_small() { curl -sks --range 0-1023 --max-time 10 "$1" | head -c 1024 || true; }
+
+          # ============ DNS helpers ============
+          dig_one() { dig +short "$1" "$2" 2>/dev/null | head -n1; }
+          dig_cname() { dig_one CNAME "$1"; }
+          dig_arec() { dig +short A "$1" 2>/dev/null | paste -sd ',' - || true; }
+          dig_aaaa() { dig +short AAAA "$1" 2>/dev/null | paste -sd ',' - || true; }
+          dig_ns_apex() { dig +short NS "$1" 2>/dev/null | tr -d '.' | paste -sd ',' - || true; }
+          dig_soa() { dig +short SOA "$1" 2>/dev/null | awk '{print $1}' | tr -d '.' | head -n1 || true; }
+          is_route53_zone() {
+            local apex="$1"; local ns="$(dig_ns_apex "$apex")"; local soa="$(dig_soa "$apex")"
+            if echo "$ns,$soa" | grep -qi 'awsdns'; then echo "yes"; else echo "no"; fi
           }
 
-          dig_cname() {
-            local host="$1"
-            dig +short CNAME "$host" 2>/dev/null | head -n1
-          }
-
-          dig_arec() {
-            local host="$1"
-            dig +short A "$host" 2>/dev/null | paste -sd ',' - || true
-          }
-
-          tls_issuer_subject() {
+          # ============ TLS helpers ============
+          tls_meta() {
             local host="$1"
             timeout 12 bash -c \
               "echo | openssl s_client -servername \"$host\" -connect \"$host\":443 2>/dev/null \
                | openssl x509 -noout -issuer -subject -dates 2>/dev/null" || true
           }
 
-          try_oidc() {
-            local host="$1"
-            local url="https://${host}/.well-known/openid-configuration"
-            : > /tmp/oidc.json
-            curl -sk --max-time 12 "$url" -o /tmp/oidc.json || true
-            if jq -e . </tmp/oidc.json >/dev/null 2>&1; then
-              local issuer jwks
-              issuer=$(jq -r '.issuer // empty' /tmp/oidc.json)
-              jwks=$(jq -r '.jwks_uri // empty' /tmp/oidc.json)
-              echo "issuer=$issuer; jwks=$jwks"
-            fi
-          }
-
-          head_path() {
-            local url="$1"
-            curl -skI --max-time 10 "$url" | head -n 20 | tr -d '\r' || true
+          # ============ AWS-specific ============
+          summarize_aws_signals() {
+            # Lê de STDIN os headers/coisas diversas e marca serviços
+            awk '
+              BEGIN{cf=elb=apigw=cognito=s3=amplify=lambdaurl=0}
+              /x-amz-cf-id|x-amz-cf-pop|cloudfront\.net|X-Cache:.*CloudFront/i {cf=1}
+              /elb\.amazonaws\.com|awselb|AWSALB|AWSALBTG/i {elb=1}
+              /x-amzn-requestid|x-amz-apigw-id/i {apigw=1}
+              /cognito-idp.*amazonaws\.com|\.amazoncognito\.com/i {cognito=1}
+              /Server: AmazonS3|x-amz-bucket-region/i {s3=1}
+              /amplifyapp\.com/i {amplify=1}
+              /lambda-url\..*\.on\.aws/i {lambdaurl=1}
+              END{
+                out=""
+                if(cf) out=out "CloudFront "
+                if(elb) out=out "ELB/ALB "
+                if(apigw) out=out "API-GW "
+                if(cognito) out=out "Cognito "
+                if(s3) out=out "S3 "
+                if(amplify) out=out "Amplify "
+                if(lambdaurl) out=out "LambdaURL "
+                if(out=="") out="-"
+                print out
+              }'
           }
 
           s3_probe() {
@@ -85,112 +98,212 @@ jobs:
             curl -skI --max-time 8 "https://${bucket}.s3.amazonaws.com/" | tr -d '\r' || true
           }
 
-          summarize_aws_signals() {
-            awk '
-              BEGIN{cf=elb=apigw=cognito=s3=0}
-              /x-amz-cf-id|X-Amz-Cf-Id|cloudfront/ {cf=1}
-              /X-Cache:.*cloudfront/i {cf=1}
-              /elb\.amazonaws\.com/ {elb=1}
-              /awselb\/2\.0/i {elb=1}
-              /x-amzn-requestid|x-amz-apigw-id/i {apigw=1}
-              /cognito-idp.*amazonaws\.com|\.amazoncognito\.com/ {cognito=1}
-              /Server: AmazonS3/i {s3=1}
+          # Candidatos de bucket a partir do host
+          s3_candidates() {
+            local host="$1"
+            local apex="${host#*.}"
+            local base="${apex%%.*}"
+            echo "$apex"
+            echo "$base" "$base-static" "$base-assets" "$base-backups"
+            echo "${host//./-}" "${host//./}-static"
+          }
+
+          # OIDC discovery (Cognito Hosted UI etc.)
+          try_oidc() {
+            local host="$1"
+            local url="https://${host}/.well-known/openid-configuration"
+            local tmp; tmp=$(mktemp)
+            curl -sk --max-time 12 "$url" -o "$tmp" || true
+            if jq -e . <"$tmp" >/dev/null 2>&1; then
+              jq -r '{issuer, jwks_uri, authorization_endpoint, token_endpoint} | to_entries[] | select(.value!=null) | "\(.key)=\(.value)"' "$tmp"
+            fi
+          }
+
+          # Lint básico de headers de segurança (passivo)
+          lint_security_headers() {
+            # Entrada: cabeçalhos
+            # Saída JSON de findings (um por linha)
+            awk -v host="$1" '
+              BEGIN{FS=": "; OFS=""}
+              {
+                h[tolower($1)]=$0
+                if(tolower($1)=="access-control-allow-origin") acao=$2
+                if(tolower($1)=="access-control-allow-credentials") acac=$2
+              }
               END{
-                out=""
-                if(cf) out=out "CloudFront "
-                if(elb) out=out "ELB "
-                if(apigw) out=out "API-GW "
-                if(cognito) out=out "Cognito "
-                if(s3) out=out "S3 "
-                if(out=="") out="-"
-                print out
+                # Falta HSTS
+                if(!( "strict-transport-security" in h)){
+                  print "{\"host\":\""host"\",\"rule\":\"HSTS_MISSING\",\"severity\":\"MEDIUM\",\"desc\":\"Strict-Transport-Security ausente\"}"
+                }
+                # CSP ausente
+                if(!( "content-security-policy" in h)){
+                  print "{\"host\":\""host"\",\"rule\":\"CSP_MISSING\",\"severity\":\"MEDIUM\",\"desc\":\"Content-Security-Policy ausente\"}"
+                }
+                # X-Frame-Options ausente
+                if(!( "x-frame-options" in h)){
+                  print "{\"host\":\""host"\",\"rule\":\"XFO_MISSING\",\"severity\":\"LOW\",\"desc\":\"X-Frame-Options ausente\"}"
+                }
+                # CORS permissivo
+                if(acao ~ /\*/ && tolower(acac) ~ /true/){
+                  print "{\"host\":\""host"\",\"rule\":\"CORS_OVERPERMISSIVE\",\"severity\":\"HIGH\",\"desc\":\"CORS com * e credenciais\"}"
+                }
               }'
+          }
+
+          # Probes leves de docs de API (passivo, GET pequeno)
+          probe_openapi() {
+            local base="https://$1"
+            local paths="/openapi.json /openapi.yaml /swagger.json /swagger.yaml /swagger-ui.html /api-docs"
+            for p in $paths; do
+              local u="${base}${p}"
+              local code
+              code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 "$u" || true)
+              if [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ]; then
+                echo "${p}:${code}"
+              fi
+            done
           }
           BASH
           chmod +x utils.sh
 
       - name: 🧪 Coleta passiva por host
-        shell: bash
         run: |
           set -euo pipefail
           . ./utils.sh
           : > results.jsonl
+          : > findings.jsonl
 
           while read -r host; do
             echo "==== $host ===="
 
-            H_HTTPS="$(fetch_headers "$host" "https")"
-            H_HTTP="$(fetch_headers "$host" "http")"
-
+            # DNS
             CNAME="$(dig_cname "$host" || true)"
             AREC="$(dig_arec "$host" || true)"
+            AAAA="$(dig_aaaa "$host" || true)"
+            APEX="${host#*.}"
+            R53="$(is_route53_zone "$APEX")" || R53="no"
 
-            TLS="$(tls_issuer_subject "$host" || true)"
+            # Headers/TLS
+            H_HTTPS="$(fetch_headers "$host" https)"
+            H_HTTP="$(fetch_headers "$host" http)"
+            TLS="$(tls_meta "$host" || true)"
+
+            # AWS fingerprints adicionais
             OIDC="$(try_oidc "$host" || true)"
-
             H_DEV="$(head_path "https://${host}/dev/")"
             H_PROD="$(head_path "https://${host}/prod/")"
             H_V1="$(head_path "https://${host}/v1/")"
+            OPENAPI="$(probe_openapi "$host" | paste -sd ';' -)"
 
-            APEX="${host#*.}"
-            BASE="${APEX%%.*}"
-            S3CANDS=()
-            [[ -n "$APEX" ]] && S3CANDS+=("$APEX" "$BASE" "${BASE}-static" "${BASE}-assets" "${BASE}-backups")
-            S3CANDS+=("${host//./-}" "${host//./}-static")
-
-            S3R=""
-            for b in "${S3CANDS[@]}"; do
-              RESP="$(s3_probe "$b")"
-              if echo "$RESP" | grep -qiE 'AmazonS3|NoSuchBucket|AccessDenied'; then
-                first=$(echo "$RESP" | head -n1)
-                S3R="${S3R}${b}:${first}; "
-              fi
-            done
-
-            HEU="$(printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n" \
-              "$H_HTTPS" "$H_HTTP" "$CNAME" "$TLS" "$OIDC" "$H_DEV" "$H_PROD" "$H_V1" | summarize_aws_signals)"
-
+            # Lambda URL / Amplify via CNAME
             HINTS=""
             [[ "$CNAME" =~ cloudfront.net$ ]] && HINTS="$HINTS CNAME->CloudFront;"
             [[ "$CNAME" =~ elb\.amazonaws\.com$ ]] && HINTS="$HINTS CNAME->ELB;"
+            [[ "$CNAME" =~ lambda-url\..*\.on\.aws$ ]] && HINTS="$HINTS CNAME->LambdaURL;"
+            [[ "$CNAME" =~ amplifyapp\.com$ ]] && HINTS="$HINTS CNAME->Amplify;"
             echo "$H_HTTPS$H_HTTP$H_DEV$H_PROD$H_V1" | grep -qi 'x-amzn' && HINTS="$HINTS x-amzn-*;"
             echo "$H_HTTPS$H_HTTP" | grep -qi 'X-Cache:.*cloudfront' && HINTS="$HINTS X-Cache cloudfront;"
-            echo "$OIDC" | grep -qi 'cognito' && HINTS="$HINTS OIDC cognito;"
 
-            jq -n --arg host "$host" \
-                  --arg cname "$CNAME" \
-                  --arg arec "$AREC" \
-                  --arg aws "$HEU" \
-                  --arg hints "$(echo "$HINTS" | sed 's/[[:space:]]\+/ /g')" \
-                  --arg tls "$TLS" \
-                  --arg oidc "$OIDC" \
-                  --arg s3 "$S3R" \
-                  --arg hhttps "$H_HTTPS" \
-                  --arg hhttp "$H_HTTP" \
-                  --arg hdev "$H_DEV" \
-                  --arg hprod "$H_PROD" \
-                  --arg hv1 "$H_V1" \
-                  '{host:$host,cname:$cname,arec:$arec,aws_signals:$aws,hints:$hints,tls:$tls,oidc:$oidc,s3_probe:$s3,h_https:$hhttps,h_http:$hhttp,h_dev:$hdev,h_prod:$hprod,h_v1:$hv1}' \
+            # S3 candidates (HEAD)
+            S3R=""
+            while read -r b; do
+              RESP="$(s3_probe "$b")"
+              if echo "$RESP" | grep -qiE 'AmazonS3|NoSuchBucket|AccessDenied|x-amz-bucket-region'; then
+                first=$(echo "$RESP" | head -n1)
+                region=$(echo "$RESP" | awk -F': ' 'tolower($1)=="x-amz-bucket-region"{print $2}' | head -n1)
+                S3R="${S3R}${b}:${first}${region:+ (region=${region})}; "
+              fi
+            done < <(s3_candidates "$host")
+
+            # AWS signals (consolida)
+            HEU="$(printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n" \
+              "$H_HTTPS" "$H_HTTP" "$CNAME" "$TLS" "$OIDC" "$H_DEV" "$H_PROD" "$H_V1" \
+              | summarize_aws_signals)"
+
+            # Lint de headers (gera findings)
+            {
+              echo "$H_HTTPS" | lint_security_headers "$host"
+              echo "$H_HTTP"  | lint_security_headers "$host"
+            } >> findings.jsonl
+
+            # Findings contextuais AWS (heurísticas leves)
+            if echo "$HEU" | grep -q "S3"; then
+              echo "{\"host\":\"$host\",\"rule\":\"S3_DETECTED\",\"severity\":\"INFO\",\"desc\":\"Endpoint Amazon S3 identificado (verificar Block Public Access, policies e website).\"}" >> findings.jsonl
+            fi
+            if echo "$HEU" | grep -q "CloudFront" && ! echo "$H_HTTPS" | grep -qi '^strict-transport-security:'; then
+              echo "{\"host\":\"$host\",\"rule\":\"CLOUDFRONT_NO_HSTS\",\"severity\":\"MEDIUM\",\"desc\":\"CloudFront sem HSTS no domínio alvo.\"}" >> findings.jsonl
+            fi
+            if [ -n "$OPENAPI" ]; then
+              echo "{\"host\":\"$host\",\"rule\":\"OPENAPI_DISCOVERABLE\",\"severity\":\"LOW\",\"desc\":\"Arquivos de documentação de API detectáveis: $OPENAPI\"}" >> findings.jsonl
+            fi
+            if [ "$R53" = "yes" ]; then
+              echo "{\"host\":\"$host\",\"rule\":\"ROUTE53_ZONE\",\"severity\":\"INFO\",\"desc\":\"Zona DNS aparenta estar em Route53 (NS/SOA).\"}" >> findings.jsonl
+            fi
+
+            # Persist linha completa
+            jq -n \
+              --arg host   "$host" \
+              --arg cname  "$CNAME" \
+              --arg arec   "$AREC" \
+              --arg aaaa   "$AAAA" \
+              --arg apex   "$APEX" \
+              --arg route53 "$R53" \
+              --arg aws    "$HEU" \
+              --arg hints  "$(echo "$HINTS" | sed 's/[[:space:]]\+/ /g')" \
+              --arg tls    "$TLS" \
+              --arg oidc   "$OIDC" \
+              --arg s3     "$S3R" \
+              --arg openapi "$OPENAPI" \
+              --arg hhttps "$H_HTTPS" \
+              --arg hhttp  "$H_HTTP" \
+              --arg hdev   "$H_DEV" \
+              --arg hprod  "$H_PROD" \
+              --arg hv1    "$H_V1" \
+              '{host:$host,apex:$apex,route53:$route53,cname:$cname,arec:$arec,aaaa:$aaaa,aws_signals:$aws,hints:$hints,tls:$tls,oidc:$oidc,s3_probe:$s3,openapi:$openapi,h_https:$hhttps,h_http:$hhttp,h_dev:$hdev,h_prod:$hprod,h_v1:$hv1}' \
               | tee -a results.jsonl >/dev/null
 
           done < domains.txt
 
-      - name: 📄 Gera tabela Markdown (resumo)
+      - name: 📊 Tabelas (resumo curto)
         run: |
           set -euo pipefail
           {
-            echo "| Host | CNAME | AWS Signals | Hints |"
-            echo "|---|---|---|---|"
-            jq -r '[.host, (.cname//"-"), (.aws_signals//"-"), (if .hints=="" then "-" else .hints end)] | "| " + (join(" | ")) + " |"' results.jsonl
+            echo "| Host | Route53 | CNAME | AWS Signals | Hints | OpenAPI |"
+            echo "|---|---|---|---|---|---|"
+            jq -r '[.host, (.route53//"-"), (.cname//"-"), (.aws_signals//"-"), (if .hints=="" then "-" else .hints end), (if .openapi=="" then "-" else .openapi end)] | "| " + (join(" | ")) + " |"' results.jsonl
           } > summary.md
           echo "Resumo:"
           cat summary.md
 
-      - name: 💾 Publica artefatos
+      - name: 🧪 Consolida Findings (AWS Passive DAST)
+        run: |
+          set -euo pipefail
+          # Gera um sumário legível de findings
+          {
+            echo "# AWS Passive DAST — Findings"
+            echo
+            if [ -s findings.jsonl ]; then
+              jq -r '[.severity, .host, .rule, .desc] | "- **\(.0)** — `\(.1)` — \(.2): \(.3)"' findings.jsonl
+            else
+              echo "_Sem findings até o momento._"
+            fi
+            echo
+            echo "## Dicas de próxima etapa"
+            echo "- Avaliar HSTS/CSP/XFO nos domínios sem headers."
+            echo "- Validar políticas e exposição de S3 onde detectado."
+            echo "- Revisar API Gateway (rotas /dev, /prod, /v1 e arquivos OpenAPI)."
+            echo "- CloudFront: conferir HSTS, TLS policy e WAF ACLs."
+            echo "- Cognito: revisar Hosted UI, domínios e escopos."
+          } > aws-dast-summary.md
+          sed -n '1,150p' aws-dast-summary.md
+
+      - name: 💾 Artefatos
         uses: actions/upload-artifact@v4
         with:
-          name: aws-fingerprint-results
+          name: aws-passive-dast
           path: |
             domains.txt
             results.jsonl
+            findings.jsonl
             summary.md
+            aws-dast-summary.md
