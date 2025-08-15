@@ -1,0 +1,196 @@
+name: AWS Fingerprint — multi domains (passive)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: "Lista de domínios/subdomínios (separados por vírgula)"
+        required: true
+        default: "Coloque o(s) dominios aqui separados por virgula"
+jobs:
+  fingerprint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 🧰 Setup deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq dnsutils moreutils
+          jq --version
+
+      - name: 🔎 Normaliza lista de domínios
+        id: norm
+        run: |
+          set -euo pipefail
+          RAW="${{ github.event.inputs.domains }}"
+          echo "$RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d' | sort -u > domains.txt
+          echo "Domínios:"
+          nl -ba domains.txt
+          COUNT=$(wc -l < domains.txt | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: 📦 Funções utilitárias
+        run: |
+          cat > utils.sh <<'BASH'
+          #!/usr/bin/env bash
+          set -eo pipefail
+
+          fetch_headers() {
+            local host="$1"
+            local scheme="${2:-https}"
+            local url="${scheme}://${host}/"
+            curl -skI --max-time 12 "$url" | tr -d '\r' > /tmp/h.txt || true
+            cat /tmp/h.txt
+          }
+
+          dig_cname() {
+            local host="$1"
+            dig +short CNAME "$host" 2>/dev/null | head -n1
+          }
+
+          dig_arec() {
+            local host="$1"
+            dig +short A "$host" 2>/dev/null | paste -sd ',' - || true
+          }
+
+          tls_issuer_subject() {
+            local host="$1"
+            timeout 12 bash -c \
+              "echo | openssl s_client -servername \"$host\" -connect \"$host\":443 2>/dev/null \
+               | openssl x509 -noout -issuer -subject -dates 2>/dev/null" || true
+          }
+
+          try_oidc() {
+            local host="$1"
+            local url="https://${host}/.well-known/openid-configuration"
+            : > /tmp/oidc.json
+            curl -sk --max-time 12 "$url" -o /tmp/oidc.json || true
+            if jq -e . </tmp/oidc.json >/dev/null 2>&1; then
+              local issuer jwks
+              issuer=$(jq -r '.issuer // empty' /tmp/oidc.json)
+              jwks=$(jq -r '.jwks_uri // empty' /tmp/oidc.json)
+              echo "issuer=$issuer; jwks=$jwks"
+            fi
+          }
+
+          head_path() {
+            local url="$1"
+            curl -skI --max-time 10 "$url" | head -n 20 | tr -d '\r' || true
+          }
+
+          s3_probe() {
+            local bucket="$1"
+            curl -skI --max-time 8 "https://${bucket}.s3.amazonaws.com/" | tr -d '\r' || true
+          }
+
+          summarize_aws_signals() {
+            awk '
+              BEGIN{cf=elb=apigw=cognito=s3=0}
+              /x-amz-cf-id|X-Amz-Cf-Id|cloudfront/ {cf=1}
+              /X-Cache:.*cloudfront/i {cf=1}
+              /elb\.amazonaws\.com/ {elb=1}
+              /awselb\/2\.0/i {elb=1}
+              /x-amzn-requestid|x-amz-apigw-id/i {apigw=1}
+              /cognito-idp.*amazonaws\.com|\.amazoncognito\.com/ {cognito=1}
+              /Server: AmazonS3/i {s3=1}
+              END{
+                out=""
+                if(cf) out=out "CloudFront "
+                if(elb) out=out "ELB "
+                if(apigw) out=out "API-GW "
+                if(cognito) out=out "Cognito "
+                if(s3) out=out "S3 "
+                if(out=="") out="-"
+                print out
+              }'
+          }
+          BASH
+          chmod +x utils.sh
+
+      - name: 🧪 Coleta passiva por host
+        shell: bash
+        run: |
+          set -euo pipefail
+          . ./utils.sh
+          : > results.jsonl
+
+          while read -r host; do
+            echo "==== $host ===="
+
+            H_HTTPS="$(fetch_headers "$host" "https")"
+            H_HTTP="$(fetch_headers "$host" "http")"
+
+            CNAME="$(dig_cname "$host" || true)"
+            AREC="$(dig_arec "$host" || true)"
+
+            TLS="$(tls_issuer_subject "$host" || true)"
+            OIDC="$(try_oidc "$host" || true)"
+
+            H_DEV="$(head_path "https://${host}/dev/")"
+            H_PROD="$(head_path "https://${host}/prod/")"
+            H_V1="$(head_path "https://${host}/v1/")"
+
+            APEX="${host#*.}"
+            BASE="${APEX%%.*}"
+            S3CANDS=()
+            [[ -n "$APEX" ]] && S3CANDS+=("$APEX" "$BASE" "${BASE}-static" "${BASE}-assets" "${BASE}-backups")
+            S3CANDS+=("${host//./-}" "${host//./}-static")
+
+            S3R=""
+            for b in "${S3CANDS[@]}"; do
+              RESP="$(s3_probe "$b")"
+              if echo "$RESP" | grep -qiE 'AmazonS3|NoSuchBucket|AccessDenied'; then
+                first=$(echo "$RESP" | head -n1)
+                S3R="${S3R}${b}:${first}; "
+              fi
+            done
+
+            HEU="$(printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n" \
+              "$H_HTTPS" "$H_HTTP" "$CNAME" "$TLS" "$OIDC" "$H_DEV" "$H_PROD" "$H_V1" | summarize_aws_signals)"
+
+            HINTS=""
+            [[ "$CNAME" =~ cloudfront.net$ ]] && HINTS="$HINTS CNAME->CloudFront;"
+            [[ "$CNAME" =~ elb\.amazonaws\.com$ ]] && HINTS="$HINTS CNAME->ELB;"
+            echo "$H_HTTPS$H_HTTP$H_DEV$H_PROD$H_V1" | grep -qi 'x-amzn' && HINTS="$HINTS x-amzn-*;"
+            echo "$H_HTTPS$H_HTTP" | grep -qi 'X-Cache:.*cloudfront' && HINTS="$HINTS X-Cache cloudfront;"
+            echo "$OIDC" | grep -qi 'cognito' && HINTS="$HINTS OIDC cognito;"
+
+            jq -n --arg host "$host" \
+                  --arg cname "$CNAME" \
+                  --arg arec "$AREC" \
+                  --arg aws "$HEU" \
+                  --arg hints "$(echo "$HINTS" | sed 's/[[:space:]]\+/ /g')" \
+                  --arg tls "$TLS" \
+                  --arg oidc "$OIDC" \
+                  --arg s3 "$S3R" \
+                  --arg hhttps "$H_HTTPS" \
+                  --arg hhttp "$H_HTTP" \
+                  --arg hdev "$H_DEV" \
+                  --arg hprod "$H_PROD" \
+                  --arg hv1 "$H_V1" \
+                  '{host:$host,cname:$cname,arec:$arec,aws_signals:$aws,hints:$hints,tls:$tls,oidc:$oidc,s3_probe:$s3,h_https:$hhttps,h_http:$hhttp,h_dev:$hdev,h_prod:$hprod,h_v1:$hv1}' \
+              | tee -a results.jsonl >/dev/null
+
+          done < domains.txt
+
+      - name: 📄 Gera tabela Markdown (resumo)
+        run: |
+          set -euo pipefail
+          {
+            echo "| Host | CNAME | AWS Signals | Hints |"
+            echo "|---|---|---|---|"
+            jq -r '[.host, (.cname//"-"), (.aws_signals//"-"), (if .hints=="" then "-" else .hints end)] | "| " + (join(" | ")) + " |"' results.jsonl
+          } > summary.md
+          echo "Resumo:"
+          cat summary.md
+
+      - name: 💾 Publica artefatos
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws-fingerprint-results
+          path: |
+            domains.txt
+            results.jsonl
+            summary.md
